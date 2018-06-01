@@ -112,7 +112,7 @@ class SerializedRowGroup : public RowGroupReader::Contents {
 
     // PARQUET-816 workaround for old files created by older parquet-mr
     const ApplicationVersion& version = file_metadata_->writer_version();
-    if (version.VersionLt(ApplicationVersion::PARQUET_816_FIXED_VERSION)) {
+    if (version.VersionLt(ApplicationVersion::PARQUET_816_FIXED_VERSION())) {
       // The Parquet MR writer had a bug in 1.2.8 and below where it didn't include the
       // dictionary page header size in total_compressed_size and total_uncompressed_size
       // (see IMPALA-694). We add padding to compensate.
@@ -347,9 +347,18 @@ int64_t ScanFileContents(std::vector<int> columns, const int32_t column_batch_si
 
       int64_t values_read = 0;
       while (col_reader->HasNext()) {
-        total_rows[col] +=
+        int64_t levels_read =
             ScanAllValues(column_batch_size, def_levels.data(), rep_levels.data(),
                           values.data(), &values_read, col_reader.get());
+        if (col_reader->descr()->max_repetition_level() > 0) {
+          for (int64_t i = 0; i < levels_read; i++) {
+            if (rep_levels[i] == 0) {
+              total_rows[col]++;
+            }
+          }
+        } else {
+          total_rows[col] += levels_read;
+        }
       }
       col++;
     }

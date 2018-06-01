@@ -71,19 +71,21 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
       int64_t output_size = SMALL_SIZE,
       const ColumnProperties& column_properties = ColumnProperties()) {
     sink_.reset(new InMemoryOutputStream());
-    metadata_ = ColumnChunkMetaDataBuilder::Make(
-        writer_properties_, this->descr_, reinterpret_cast<uint8_t*>(&thrift_metadata_));
-    std::unique_ptr<PageWriter> pager =
-        PageWriter::Open(sink_.get(), column_properties.codec, metadata_.get());
     WriterProperties::Builder wp_builder;
-    if (column_properties.encoding == Encoding::PLAIN_DICTIONARY ||
-        column_properties.encoding == Encoding::RLE_DICTIONARY) {
+    if (column_properties.encoding() == Encoding::PLAIN_DICTIONARY ||
+        column_properties.encoding() == Encoding::RLE_DICTIONARY) {
       wp_builder.enable_dictionary();
     } else {
       wp_builder.disable_dictionary();
-      wp_builder.encoding(column_properties.encoding);
+      wp_builder.encoding(column_properties.encoding());
     }
+    wp_builder.max_statistics_size(column_properties.max_statistics_size());
     writer_properties_ = wp_builder.build();
+
+    metadata_ = ColumnChunkMetaDataBuilder::Make(
+        writer_properties_, this->descr_, reinterpret_cast<uint8_t*>(&thrift_metadata_));
+    std::unique_ptr<PageWriter> pager =
+        PageWriter::Open(sink_.get(), column_properties.compression(), metadata_.get());
     std::shared_ptr<ColumnWriter> writer =
         ColumnWriter::Make(metadata_.get(), std::move(pager), writer_properties_.get());
     return std::static_pointer_cast<TypedColumnWriter<TestType>>(writer);
@@ -110,11 +112,11 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
 
     this->WriteRequiredWithSettings(encoding, compression, enable_dictionary,
                                     enable_statistics, num_rows);
-    this->ReadAndCompare(compression, num_rows);
+    ASSERT_NO_FATAL_FAILURE(this->ReadAndCompare(compression, num_rows));
 
     this->WriteRequiredWithSettingsSpaced(encoding, compression, enable_dictionary,
                                           enable_statistics, num_rows);
-    this->ReadAndCompare(compression, num_rows);
+    ASSERT_NO_FATAL_FAILURE(this->ReadAndCompare(compression, num_rows));
   }
 
   void WriteRequiredWithSettings(Encoding::type encoding, Compression::type compression,
@@ -171,6 +173,16 @@ class TestPrimitiveWriter : public PrimitiveTypedTest<TestType> {
     auto metadata_accessor = ColumnChunkMetaData::Make(
         reinterpret_cast<const uint8_t*>(&thrift_metadata_), this->descr_);
     return metadata_accessor->num_values();
+  }
+
+  bool metadata_is_stats_set() {
+    // Metadata accessor must be created lazily.
+    // This is because the ColumnChunkMetaData semantics dictate the metadata object is
+    // complete (no changes to the metadata buffer can be made after instantiation)
+    ApplicationVersion app_version(this->writer_properties_->created_by());
+    auto metadata_accessor = ColumnChunkMetaData::Make(
+        reinterpret_cast<const uint8_t*>(&thrift_metadata_), this->descr_, &app_version);
+    return metadata_accessor->is_stats_set();
   }
 
   std::vector<Encoding::type> metadata_encodings() {
@@ -520,6 +532,50 @@ TEST_F(TestBooleanValuesWriter, AlternateBooleanValues) {
   }
 }
 
+// PARQUET-979
+// Prevent writing large stats
+using TestByteArrayValuesWriter = TestPrimitiveWriter<ByteArrayType>;
+TEST_F(TestByteArrayValuesWriter, OmitStats) {
+  int min_len = 1024 * 4;
+  int max_len = 1024 * 8;
+  this->SetUpSchema(Repetition::REQUIRED);
+  auto writer = this->BuildWriter();
+
+  values_.resize(SMALL_SIZE);
+  InitWideByteArrayValues(SMALL_SIZE, this->values_, this->buffer_, min_len, max_len);
+  writer->WriteBatch(SMALL_SIZE, nullptr, nullptr, this->values_.data());
+  writer->Close();
+
+  ASSERT_FALSE(this->metadata_is_stats_set());
+}
+
+TEST_F(TestByteArrayValuesWriter, LimitStats) {
+  int min_len = 1024 * 4;
+  int max_len = 1024 * 8;
+  this->SetUpSchema(Repetition::REQUIRED);
+  ColumnProperties column_properties;
+  column_properties.set_max_statistics_size(static_cast<size_t>(max_len));
+  auto writer = this->BuildWriter(SMALL_SIZE, column_properties);
+
+  values_.resize(SMALL_SIZE);
+  InitWideByteArrayValues(SMALL_SIZE, this->values_, this->buffer_, min_len, max_len);
+  writer->WriteBatch(SMALL_SIZE, nullptr, nullptr, this->values_.data());
+  writer->Close();
+
+  ASSERT_TRUE(this->metadata_is_stats_set());
+}
+
+TEST_F(TestByteArrayValuesWriter, CheckDefaultStats) {
+  this->SetUpSchema(Repetition::REQUIRED);
+  auto writer = this->BuildWriter();
+  this->GenerateData(SMALL_SIZE);
+
+  writer->WriteBatch(SMALL_SIZE, nullptr, nullptr, this->values_ptr_);
+  writer->Close();
+
+  ASSERT_TRUE(this->metadata_is_stats_set());
+}
+
 void GenerateLevels(int min_repeat_factor, int max_repeat_factor, int max_level,
                     std::vector<int16_t>& input_levels) {
   // for each repetition count upto max_repeat_factor
@@ -644,9 +700,11 @@ TEST(TestLevels, TestLevelsDecodeMultipleBitWidth) {
       int16_t max_level = static_cast<int16_t>((1 << bit_width) - 1);
       // Generate levels
       GenerateLevels(min_repeat_factor, max_repeat_factor, max_level, input_levels);
-      EncodeLevels(encoding, max_level, static_cast<int>(input_levels.size()),
-                   input_levels.data(), bytes);
-      VerifyDecodingLevels(encoding, max_level, input_levels, bytes);
+      ASSERT_NO_FATAL_FAILURE(EncodeLevels(encoding, max_level,
+                                           static_cast<int>(input_levels.size()),
+                                           input_levels.data(), bytes));
+      ASSERT_NO_FATAL_FAILURE(
+          VerifyDecodingLevels(encoding, max_level, input_levels, bytes));
       input_levels.clear();
     }
   }
@@ -672,10 +730,12 @@ TEST(TestLevels, TestLevelsDecodeMultipleSetData) {
     Encoding::type encoding = encodings[encode];
     for (int rf = 0; rf < setdata_factor; rf++) {
       int offset = rf * split_level_size;
-      EncodeLevels(encoding, max_level, split_level_size,
-                   reinterpret_cast<int16_t*>(input_levels.data()) + offset, bytes[rf]);
+      ASSERT_NO_FATAL_FAILURE(EncodeLevels(
+          encoding, max_level, split_level_size,
+          reinterpret_cast<int16_t*>(input_levels.data()) + offset, bytes[rf]));
     }
-    VerifyDecodingMultipleSetData(encoding, max_level, input_levels, bytes);
+    ASSERT_NO_FATAL_FAILURE(
+        VerifyDecodingMultipleSetData(encoding, max_level, input_levels, bytes));
   }
 }
 

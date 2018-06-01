@@ -193,9 +193,9 @@ class LevelBuilder {
   }
 
   Status HandleNonNullList(int16_t def_level, int16_t rep_level, int64_t index) {
-    int32_t inner_offset = offsets_[rep_level][index];
-    int32_t inner_length = offsets_[rep_level][index + 1] - inner_offset;
-    int64_t recursion_level = rep_level + 1;
+    const int32_t inner_offset = offsets_[rep_level][index];
+    const int32_t inner_length = offsets_[rep_level][index + 1] - inner_offset;
+    const int64_t recursion_level = rep_level + 1;
     if (inner_length == 0) {
       return def_levels_.Append(def_level);
     }
@@ -205,14 +205,21 @@ class LevelBuilder {
                                inner_length);
     } else {
       // We have reached the leaf: primitive list, handle remaining nullables
+      const bool nullable_level = nullable_[recursion_level];
+      const int64_t level_null_count = null_counts_[recursion_level];
+      const uint8_t* level_valid_bitmap = valid_bitmaps_[recursion_level];
+
       for (int64_t i = 0; i < inner_length; i++) {
         if (i > 0) {
           RETURN_NOT_OK(rep_levels_.Append(static_cast<int16_t>(rep_level + 1)));
         }
-        if (nullable_[recursion_level] &&
-            ((null_counts_[recursion_level] == 0) ||
-             BitUtil::GetBit(valid_bitmaps_[recursion_level],
-                             inner_offset + i + array_offsets_[recursion_level]))) {
+        if (level_null_count && level_valid_bitmap == nullptr) {
+          // Special case: this is a null array (all elements are null)
+          RETURN_NOT_OK(def_levels_.Append(static_cast<int16_t>(def_level + 1)));
+        } else if (nullable_level && ((level_null_count == 0) ||
+            BitUtil::GetBit(level_valid_bitmap,
+                            inner_offset + i + array_offsets_[recursion_level]))) {
+          // Non-null element in a null level
           RETURN_NOT_OK(def_levels_.Append(static_cast<int16_t>(def_level + 2)));
         } else {
           // This can be produced in two case:
@@ -595,7 +602,14 @@ Status ArrowColumnWriter::WriteTimestamps(const Array& values, int64_t num_level
 
   const bool is_nanosecond = type.unit() == TimeUnit::NANO;
 
-  if (is_nanosecond && ctx_->properties->support_deprecated_int96_timestamps()) {
+  // In the case where support_deprecated_int96_timestamps was specified
+  // and coerce_timestamps_enabled was specified, a nanosecond column
+  // will have a physical type of int64. In that case, we fall through
+  // to the else if below.
+  //
+  // See https://issues.apache.org/jira/browse/ARROW-2082
+  if (is_nanosecond && ctx_->properties->support_deprecated_int96_timestamps() &&
+      !ctx_->properties->coerce_timestamps_enabled()) {
     return TypedWriteBatch<Int96Type, ::arrow::TimestampType>(values, num_levels,
                                                               def_levels, rep_levels);
   } else if (is_nanosecond ||
@@ -962,7 +976,7 @@ class FileWriter::Impl {
       ::arrow::compute::Datum cast_output;
       RETURN_NOT_OK(Cast(&ctx, cast_input, dict_type.dictionary()->type(), CastOptions(),
                          &cast_output));
-      return WriteColumnChunk(cast_output.chunked_array(), 0, data->length());
+      return WriteColumnChunk(cast_output.chunked_array(), offset, size);
     }
 
     ColumnWriter* column_writer;

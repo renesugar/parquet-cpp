@@ -38,9 +38,9 @@ using KeyValueMetadata = ::arrow::KeyValueMetadata;
 class ApplicationVersion {
  public:
   // Known Versions with Issues
-  static const ApplicationVersion PARQUET_251_FIXED_VERSION;
-  static const ApplicationVersion PARQUET_816_FIXED_VERSION;
-  static const ApplicationVersion PARQUET_CPP_FIXED_STATS_VERSION;
+  static const ApplicationVersion& PARQUET_251_FIXED_VERSION();
+  static const ApplicationVersion& PARQUET_816_FIXED_VERSION();
+  static const ApplicationVersion& PARQUET_CPP_FIXED_STATS_VERSION();
   // Regular expression for the version format
   // major . minor . patch unknown - prerelease.x + build info
   // Eg: 1.5.0ab-cdh5.5.0+cd
@@ -74,6 +74,7 @@ class ApplicationVersion {
 
   ApplicationVersion() {}
   explicit ApplicationVersion(const std::string& created_by);
+  ApplicationVersion(const std::string& application, int major, int minor, int patch);
 
   // Returns true if version is strictly less than other_version
   bool VersionLt(const ApplicationVersion& other_version) const;
@@ -107,7 +108,7 @@ class PARQUET_EXPORT ColumnChunkMetaData {
   std::shared_ptr<RowGroupStatistics> statistics() const;
   Compression::type compression() const;
   const std::vector<Encoding::type>& encodings() const;
-  int64_t has_dictionary_page() const;
+  bool has_dictionary_page() const;
   int64_t dictionary_page_offset() const;
   int64_t data_page_offset() const;
   int64_t index_page_offset() const;
